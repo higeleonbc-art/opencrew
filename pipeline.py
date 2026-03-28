@@ -24,11 +24,22 @@ from pathlib import Path
 import anthropic
 
 from .asset_finder import AssetFinder, AssetMatch
+from .cinematic_clipper import CinematicClipper
 from .decision_store import AssetDecision, DecisionStore
 from .face_compositor import CompositeRequest, FaceCompositor
+from .irasutoya_downloader import IrasutoyaDownloader
 from .layout_checker import LayoutChecker
 from .notifier import Notifier
-from .script_analyzer import ScriptAnalysis, SceneLine, analyze_script, analyze_script_with_ai
+from .preview_gui import PreviewManager
+from .riot_asset_downloader import RiotAssetDownloader
+from .script_analyzer import (
+    CHAMPION_NAME_MAP,
+    ScriptAnalysis,
+    SceneLine,
+    analyze_script,
+    analyze_script_with_ai,
+    suggest_irasutoya_keyword,
+)
 
 
 @dataclass
@@ -101,6 +112,35 @@ class OpenCrewPipeline:
             client=self.client
         ) if self.client and self.layout_qa_enabled else None
 
+        # 新機能: Riot素材ダウンローダー
+        self.riot_downloader = RiotAssetDownloader(resolved_dirs)
+
+        # 新機能: いらすとやダウンローダー（利用規約準拠）
+        irasutoya_dir = resolved_dirs.get("irasutoya", "./opencrew_assets/irasutoya")
+        self.irasutoya_downloader = IrasutoyaDownloader(
+            save_dir=irasutoya_dir,
+            tracker_path=os.path.join(
+                os.path.dirname(oc_config.get("db_path", ".")),
+                ".irasutoya_usage.json",
+            ),
+        )
+
+        # 新機能: シネマティッククリッパー
+        cinematic_dir = resolved_dirs.get("cinematic", "./opencrew_assets/cinematic")
+        self.clipper = CinematicClipper(
+            client=self.client,
+            use_vision=oc_config.get("cinematic_vision_analysis", False),
+            output_dir=os.path.join(cinematic_dir, "clips"),
+        )
+
+        # 新機能: GUIプレビュー
+        self.preview = PreviewManager()
+
+        # 自動ダウンロード設定
+        self.auto_download_riot = oc_config.get("auto_download_riot", True)
+        self.auto_download_irasutoya = oc_config.get("auto_download_irasutoya", True)
+        self.auto_clip_cinematic = oc_config.get("auto_clip_cinematic", True)
+
         # 合成画像の一時保存先
         self._temp_dir = tempfile.mkdtemp(prefix="opencrew_")
 
@@ -127,7 +167,14 @@ class OpenCrewPipeline:
         print(f"  全登場チャンピオン: {', '.join(analysis.all_champions)}")
         print(f"  セリフ数: {analysis.total_lines}")
 
-        # Step 2: 素材検索 & 不足チェック
+        # Step 2: Riot素材の自動ダウンロード
+        if self.auto_download_riot:
+            print("\n=== OpenCrew: Riot素材自動ダウンロード ===")
+            self.riot_downloader.download_missing_only(
+                analysis.all_champions, self.finder
+            )
+
+        # Step 3: 素材検索 & 不足チェック
         print("\n=== OpenCrew: 素材検索 ===")
         all_assets: dict[str, dict[str, list[AssetMatch]]] = {}
         for champ in analysis.all_champions:
@@ -139,22 +186,41 @@ class OpenCrewPipeline:
             print(f"  {champ}: スプラッシュ={splash_count}, "
                   f"シネマティック={cine_count}, アイコン={icon_count}")
 
-        # 不足素材チェック
+        # シネマティック動画のクリッピング
         need_cinematic = any(
             l.suggested_asset_type == "cinematic" for l in analysis.lines
         )
+        if self.auto_clip_cinematic and need_cinematic:
+            cinematic_dir = self.finder.asset_dirs.get("cinematic")
+            if cinematic_dir and Path(cinematic_dir).exists():
+                print("\n=== OpenCrew: シネマティッククリッピング ===")
+                self.clipper.process_all(cinematic_dir)
+
+        # 不足素材チェック
         missing = self.finder.check_missing(
             analysis.all_champions, need_cinematic=need_cinematic
         )
 
-        # いらすとや素材の確認
+        # いらすとや素材の確認＆自動ダウンロード
         irasutoya_lines = [
             l for l in analysis.lines
             if l.suggested_asset_type == "irasutoya_composite"
         ]
         if irasutoya_lines:
             available_irasutoya = self.finder.list_available_irasutoya()
-            if not available_irasutoya:
+            if not available_irasutoya and self.auto_download_irasutoya:
+                print("\n=== OpenCrew: いらすとや素材ダウンロード ===")
+                # 場面ごとに必要なキーワードを集約
+                context_keywords = {}
+                for line in irasutoya_lines:
+                    kw = line.suggested_irasutoya_keyword
+                    if kw and line.scene_context not in context_keywords:
+                        context_keywords[line.scene_context] = kw
+                if context_keywords:
+                    self.irasutoya_downloader.download_for_contexts(context_keywords)
+                    # 使用状況レポート
+                    print(self.irasutoya_downloader.get_usage_report())
+            elif not available_irasutoya:
                 missing.append("いらすとや素材（1つ以上必要）")
 
         if missing:
@@ -282,21 +348,25 @@ class OpenCrewPipeline:
     def _confirm_assignment(
         self, line: SceneLine, assignment: LineAssetAssignment
     ) -> bool:
-        """人間に素材割り当てを確認してもらう"""
-        print(f"\n  --- セリフ {line.index + 1}/{line.text[:30]}... ---")
-        print(f"  場面: {line.scene_context}")
-        print(f"  提案: {assignment.asset_type}")
-        if assignment.asset_path:
-            print(f"  素材: {Path(assignment.asset_path).name}")
+        """人間に素材割り当てを確認してもらう（GUI対応）"""
+        metadata = {
+            "セ���フ": f"{line.index + 1}: {line.text[:50]}",
+            "場面": line.scene_context,
+            "提案": assignment.asset_type,
+        }
         if assignment.irasutoya_path:
-            print(f"  いらすとや: {Path(assignment.irasutoya_path).name}")
-            print(f"  アイコン: {[Path(p).name for p in assignment.icon_paths]}")
+            metadata["いらすとや"] = Path(assignment.irasutoya_path).name
+            metadata["アイコン"] = str([Path(p).name for p in assignment.icon_paths])
 
-        result = self.notifier.prompt_confirm(
-            "この素材割り当てを承認しますか？",
-            default="y",
+        # 表示する画像パス
+        image_path = assignment.asset_path or assignment.splash_bg_path or ""
+
+        return self.preview.show_approval(
+            title=f"素材割り当て確認 - セリフ {line.index + 1}",
+            description=line.text[:80],
+            image_path=image_path,
+            metadata=metadata,
         )
-        return result == "y"
 
     def _process_composites(
         self,
@@ -339,7 +409,7 @@ class OpenCrewPipeline:
                 assignment.asset_path = out_path
                 print(f"    完了: {out_path}")
 
-                # 確認モード: プレビューを見せる
+                # 確認モード: GUIプレビューを見せる
                 if self.mode == "confirmation":
                     preview = self.compositor.generate_preview(request)
                     if preview:
@@ -349,9 +419,14 @@ class OpenCrewPipeline:
                         )
                         preview.save(preview_path)
 
-                        approved = self.notifier.show_preview_and_confirm(
-                            f"セリフ{assignment.line_index + 1}の合成結果",
-                            preview_path,
+                        approved = self.preview.show_approval(
+                            title=f"合成結果確認 - セリフ {assignment.line_index + 1}",
+                            description="いらすとや＋チャンピオンアイコン合���結果",
+                            image=preview,
+                            metadata={
+                                "いらすとや": Path(assignment.irasutoya_path).name,
+                                "アイコン数": str(len(assignment.icon_paths)),
+                            },
                         )
                         if approved and self.compositor.store:
                             self.compositor.store.confirm_face_positions(
