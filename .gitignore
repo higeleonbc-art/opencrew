@@ -1,0 +1,8 @@
+__pycache__/
+*.pyc
+*.db
+opencrew_assets/**/*.png
+opencrew_assets/**/*.jpg
+opencrew_assets/**/*.mp4
+opencrew_assets/**/*.mov
+!opencrew_assets/**/.gitkeep
