@@ -170,9 +170,13 @@ class OpenCrewPipeline:
         # Step 2: Riot素材の自動ダウンロード
         if self.auto_download_riot:
             print("\n=== OpenCrew: Riot素材自動ダウンロード ===")
-            self.riot_downloader.download_missing_only(
-                analysis.all_champions, self.finder
-            )
+            try:
+                self.riot_downloader.download_missing_only(
+                    analysis.all_champions, self.finder
+                )
+            except Exception as e:
+                print(f"  [エラー] Riot素材ダウンロード失敗: {e}")
+                print("  ダウンロードをスキップして続行します")
 
         # Step 3: 素材検索 & 不足チェック
         print("\n=== OpenCrew: 素材検索 ===")
@@ -206,21 +210,31 @@ class OpenCrewPipeline:
             l for l in analysis.lines
             if l.suggested_asset_type == "irasutoya_composite"
         ]
-        if irasutoya_lines:
-            available_irasutoya = self.finder.list_available_irasutoya()
-            if not available_irasutoya and self.auto_download_irasutoya:
-                print("\n=== OpenCrew: いらすとや素材ダウンロード ===")
-                # 場面ごとに必要なキーワードを集約
-                context_keywords = {}
-                for line in irasutoya_lines:
-                    kw = line.suggested_irasutoya_keyword
-                    if kw and line.scene_context not in context_keywords:
-                        context_keywords[line.scene_context] = kw
-                if context_keywords:
-                    self.irasutoya_downloader.download_for_contexts(context_keywords)
+        if irasutoya_lines and self.auto_download_irasutoya:
+            print("\n=== OpenCrew: いらすとや素材ダウンロード ===")
+            # 場面ごとに必要なキーワードを集約
+            context_keywords = {}
+            for line in irasutoya_lines:
+                kw = line.suggested_irasutoya_keyword
+                if kw and line.scene_context not in context_keywords:
+                    context_keywords[line.scene_context] = kw
+            if context_keywords:
+                try:
+                    self.irasutoya_downloader.download_for_contexts(
+                        context_keywords
+                    )
                     # 使用状況レポート
                     print(self.irasutoya_downloader.get_usage_report())
-            elif not available_irasutoya:
+                except Exception as e:
+                    print(f"  [エラー] いらすとやダウンロード失敗: {e}")
+                    print("  ダウンロードをスキップして続行します")
+            # ダウンロード後も不足していれば通知
+            available_irasutoya = self.finder.list_available_irasutoya()
+            if not available_irasutoya:
+                missing.append("いらすとや素材（1つ以上必要）")
+        elif irasutoya_lines:
+            available_irasutoya = self.finder.list_available_irasutoya()
+            if not available_irasutoya:
                 missing.append("いらすとや素材（1つ以上必要）")
 
         if missing:

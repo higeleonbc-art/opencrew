@@ -298,7 +298,6 @@ def search_irasutoya(
         resp = requests.get(
             IRASUTOYA_SEARCH, params=params, headers=_HEADERS,
             timeout=_REQUEST_TIMEOUT,
-            allow_redirects=False,  # リダイレクトを追跡しない
         )
         resp.raise_for_status()
 
@@ -444,11 +443,16 @@ class IrasutoyaDownloader:
                 item.image_url, headers=_HEADERS,
                 timeout=_REQUEST_TIMEOUT,
                 stream=True,
-                allow_redirects=False,
             )
             resp.raise_for_status()
 
             self._limiter.record_download()
+
+            # リダイレクト先URLの安全性チェック
+            if resp.url != item.image_url and not _validate_url(resp.url):
+                print(f"  [拒否] リダイレクト先が許可されていないドメイン: {resp.url}")
+                resp.close()
+                return item
 
             # Content-Lengthチェック（ヘッダがある場合）
             content_length = resp.headers.get("Content-Length")
