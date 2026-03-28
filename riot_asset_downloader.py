@@ -7,6 +7,13 @@ Data Dragon: https://developer.riotgames.com/docs/lol#data-dragon
 - 公式の静的データ配信CDN
 - APIキー不要（公開リソース）
 - スプラッシュアートとアイコンを取得可能
+
+【サーバー保護ポリシー】
+- Data DragonはRiotの公式CDNで静的ファイル配信のため負荷は低い
+- それでもリクエスト間隔を確保（1秒）
+- 1セッションあたりのDL上限を設定（200ファイル）
+- ファイルサイズ上限（20MB）
+- エラー時のリトライなし
 """
 
 from __future__ import annotations
@@ -15,6 +22,7 @@ import json
 import time
 from dataclasses import dataclass, field
 from pathlib import Path
+from urllib.parse import urlparse
 
 import requests
 
@@ -24,8 +32,11 @@ from .script_analyzer import CHAMPION_NAME_MAP
 # Data Dragon ベースURL
 DDRAGON_BASE = "https://ddragon.leagueoflegends.com"
 
-# リクエスト間のスリープ（サーバー負荷軽減）
-_REQUEST_DELAY = 0.5
+# --- サーバー保護パラメータ ---
+_REQUEST_DELAY = 1.0                    # リクエスト間隔（秒）
+_MAX_DOWNLOADS_PER_SESSION = 200        # 1セッションのDL上限
+_MAX_FILE_SIZE = 20 * 1024 * 1024       # 20MB（スプラッシュアートは大きめ）
+_REQUEST_TIMEOUT = 30
 
 
 @dataclass
@@ -66,17 +77,43 @@ def get_champion_detail(version: str, champion_id: str) -> dict:
     return resp.json()["data"][champion_id]
 
 
+def _validate_ddragon_url(url: str) -> bool:
+    """URLがData Dragonドメインか検証"""
+    try:
+        parsed = urlparse(url)
+        return parsed.hostname == "ddragon.leagueoflegends.com"
+    except Exception:
+        return False
+
+
 def _download_file(url: str, dest: Path, overwrite: bool = False) -> bool:
-    """ファイルをダウンロード（既存ファイルはスキップ）"""
+    """ファイルをダウンロード（既存ファイルはスキップ、サイズ制限付き）"""
     if dest.exists() and not overwrite:
         return False
 
-    resp = requests.get(url, timeout=30, stream=True)
+    if not _validate_ddragon_url(url):
+        print(f"    [拒否] 許可されていないドメイン: {url}")
+        return False
+
+    resp = requests.get(url, timeout=_REQUEST_TIMEOUT, stream=True)
     resp.raise_for_status()
 
+    # サイズチェック
+    content_length = resp.headers.get("Content-Length")
+    if content_length and int(content_length) > _MAX_FILE_SIZE:
+        resp.close()
+        return False
+
     dest.parent.mkdir(parents=True, exist_ok=True)
+    total_size = 0
     with open(dest, "wb") as f:
         for chunk in resp.iter_content(chunk_size=8192):
+            total_size += len(chunk)
+            if total_size > _MAX_FILE_SIZE:
+                # サイズ超過 → 途中ファイルを削除
+                f.close()
+                dest.unlink(missing_ok=True)
+                return False
             f.write(chunk)
     return True
 
@@ -111,6 +148,7 @@ class RiotAssetDownloader:
         self.icons_dir = Path(asset_dirs.get("icons", "./opencrew_assets/icons"))
         self._version: str | None = None
         self._champion_data: dict | None = None
+        self._session_downloads = 0  # セッション内DLカウンタ
 
     def _ensure_data(self) -> None:
         """バージョン・チャンピオンデータを取得（キャッシュ）"""
@@ -159,6 +197,12 @@ class RiotAssetDownloader:
         skins_to_download = skins[: max_skins + 1] if max_skins > 0 else skins[:1]
 
         for i, skin in enumerate(skins_to_download):
+            # セッション上限チェック
+            if self._session_downloads >= _MAX_DOWNLOADS_PER_SESSION:
+                result.errors.append(
+                    f"セッションDL上限到達 ({_MAX_DOWNLOADS_PER_SESSION})")
+                break
+
             skin_num = skin["num"]
             url = (
                 f"{DDRAGON_BASE}/cdn/img/champion/splash/"
@@ -170,10 +214,12 @@ class RiotAssetDownloader:
                 downloaded = _download_file(url, dest, overwrite=overwrite)
                 if downloaded:
                     result.downloaded.append(str(dest))
+                    self._session_downloads += 1
                 else:
                     result.skipped.append(str(dest))
                 time.sleep(_REQUEST_DELAY)
             except Exception as e:
+                self._session_downloads += 1  # 失敗もカウント
                 result.failed.append(str(dest))
                 result.errors.append(f"DL失敗 ({dest.name}): {e}")
 
@@ -199,13 +245,21 @@ class RiotAssetDownloader:
         url = f"{DDRAGON_BASE}/cdn/{self._version}/img/champion/{champ_id}.png"
         dest = self.icons_dir / f"{champion_en}_0.png"
 
+        # セッション上限チェック
+        if self._session_downloads >= _MAX_DOWNLOADS_PER_SESSION:
+            result.errors.append(
+                f"セッションDL上限到達 ({_MAX_DOWNLOADS_PER_SESSION})")
+            return result
+
         try:
             downloaded = _download_file(url, dest, overwrite=overwrite)
             if downloaded:
                 result.downloaded.append(str(dest))
+                self._session_downloads += 1
             else:
                 result.skipped.append(str(dest))
         except Exception as e:
+            self._session_downloads += 1  # 失敗もカウント
             result.failed.append(str(dest))
             result.errors.append(f"DL失敗 ({dest.name}): {e}")
 
@@ -241,6 +295,11 @@ class RiotAssetDownloader:
         print(f"\n=== Riot素材ダウンロード: {len(targets)}チャンピオン ===")
 
         for i, en_name in enumerate(targets, 1):
+            # セッション上限チェック
+            if self._session_downloads >= _MAX_DOWNLOADS_PER_SESSION:
+                print(f"  [中止] セッションDL上限到達 ({_MAX_DOWNLOADS_PER_SESSION})")
+                break
+
             print(f"  [{i}/{len(targets)}] {en_name}...")
 
             # スプラッシュアート

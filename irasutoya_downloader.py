@@ -14,6 +14,14 @@
 
 このモジュールは20点制限をカウント・管理し、
 規約違反を防止する仕組みを組み込んでいる。
+
+【サーバー保護ポリシー】
+- robots.txt を尊重（起動時にチェック）
+- 1セッションあたりの総リクエスト数を厳格に制限（デフォルト30回）
+- リクエスト間隔を十分に確保（検索3秒、DL5秒）
+- DLファイルサイズ上限を設定（10MB）
+- エラー時のリトライなし（失敗は即座に諦める）
+- 1セッションのDL数も上限付き（デフォルト10ファイル）
 """
 
 from __future__ import annotations
@@ -24,7 +32,7 @@ import re
 import time
 from dataclasses import dataclass, field
 from pathlib import Path
-from urllib.parse import urljoin
+from urllib.parse import urljoin, urlparse
 
 import requests
 from bs4 import BeautifulSoup
@@ -37,13 +45,27 @@ IRASUTOYA_SEARCH = "https://www.irasutoya.com/search"
 # 1動画あたりの無料利用上限（サムネイル含む）
 MAX_FREE_ILLUSTRATIONS = 20
 
-# リクエスト間のスリープ（サーバー負荷軽減）
-_REQUEST_DELAY = 2.0
+# --- サーバー保護パラメータ ---
+# リクエスト間隔（秒）: サーバー負荷を最小限に
+_SEARCH_DELAY = 3.0        # 検索リクエスト後の待機時間
+_DOWNLOAD_DELAY = 5.0      # DLリクエスト後の待機時間
+
+# 1セッション（1インスタンスのライフタイム）あたりの上限
+_MAX_REQUESTS_PER_SESSION = 30     # 全リクエスト（検索+DL）の上限
+_MAX_DOWNLOADS_PER_SESSION = 10    # DLの上限
+_MAX_SEARCHES_PER_SESSION = 10     # 検索の上限
+
+# ファイルサイズ上限（バイト）: 想定外の巨大ファイルを防止
+_MAX_FILE_SIZE = 10 * 1024 * 1024  # 10MB
 
 # User-Agent（礼儀として明示）
 _HEADERS = {
-    "User-Agent": "OpenCrew-VideoTool/0.1 (educational/personal project)",
+    "User-Agent": "OpenCrew-VideoTool/0.2 (personal video project; "
+                  "max 10 downloads per session; respectful crawling)",
 }
+
+# リクエストタイムアウト（秒）
+_REQUEST_TIMEOUT = 15
 
 
 @dataclass
@@ -157,28 +179,136 @@ def _compute_hash(data: bytes) -> str:
     return hashlib.sha256(data).hexdigest()[:16]
 
 
-def search_irasutoya(keyword: str, max_results: int = 10) -> list[IrasutoyaItem]:
+def _validate_url(url: str) -> bool:
+    """DL対象URLがいらすとや関連のドメインか検証
+
+    外部サイトへのリダイレクト等を防止する。
+    """
+    try:
+        parsed = urlparse(url)
+        allowed_domains = {
+            "www.irasutoya.com",
+            "irasutoya.com",
+            "blogger.googleusercontent.com",  # Bloggerの画像CDN
+            "1.bp.blogspot.com",
+            "2.bp.blogspot.com",
+            "3.bp.blogspot.com",
+            "4.bp.blogspot.com",
+        }
+        return parsed.hostname in allowed_domains
+    except Exception:
+        return False
+
+
+class _SessionLimiter:
+    """1セッション内のリクエスト数を管理するリミッター
+
+    DoS防止・無限ループ防止のための安全弁。
+    """
+
+    def __init__(self):
+        self.total_requests = 0
+        self.search_count = 0
+        self.download_count = 0
+        self._last_request_time = 0.0
+
+    def can_search(self) -> tuple[bool, str]:
+        if self.total_requests >= _MAX_REQUESTS_PER_SESSION:
+            return False, (
+                f"セッションリクエスト上限到達 "
+                f"({self.total_requests}/{_MAX_REQUESTS_PER_SESSION})"
+            )
+        if self.search_count >= _MAX_SEARCHES_PER_SESSION:
+            return False, (
+                f"セッション検索上限到達 "
+                f"({self.search_count}/{_MAX_SEARCHES_PER_SESSION})"
+            )
+        return True, ""
+
+    def can_download(self) -> tuple[bool, str]:
+        if self.total_requests >= _MAX_REQUESTS_PER_SESSION:
+            return False, (
+                f"セッションリクエスト上限到達 "
+                f"({self.total_requests}/{_MAX_REQUESTS_PER_SESSION})"
+            )
+        if self.download_count >= _MAX_DOWNLOADS_PER_SESSION:
+            return False, (
+                f"セッションDL上限到達 "
+                f"({self.download_count}/{_MAX_DOWNLOADS_PER_SESSION})"
+            )
+        return True, ""
+
+    def record_search(self) -> None:
+        self.total_requests += 1
+        self.search_count += 1
+        self._last_request_time = time.monotonic()
+
+    def record_download(self) -> None:
+        self.total_requests += 1
+        self.download_count += 1
+        self._last_request_time = time.monotonic()
+
+    def wait_before_request(self, delay: float) -> None:
+        """前回リクエストから十分な間隔を確保"""
+        elapsed = time.monotonic() - self._last_request_time
+        remaining = delay - elapsed
+        if remaining > 0:
+            time.sleep(remaining)
+
+    def stats(self) -> str:
+        return (
+            f"リクエスト: {self.total_requests}/{_MAX_REQUESTS_PER_SESSION}, "
+            f"検索: {self.search_count}/{_MAX_SEARCHES_PER_SESSION}, "
+            f"DL: {self.download_count}/{_MAX_DOWNLOADS_PER_SESSION}"
+        )
+
+
+def search_irasutoya(
+    keyword: str,
+    max_results: int = 5,
+    limiter: _SessionLimiter | None = None,
+) -> list[IrasutoyaItem]:
     """いらすとやサイトをキーワード検索
 
     Google Bloggerベースの検索機能を利用。
 
     Args:
         keyword: 検索キーワード（日本語）
-        max_results: 最大取得件数
+        max_results: 最大取得件数（ハードリミット: 10）
+        limiter: セッションリミッター
 
     Returns:
         マッチした素材のリスト
     """
+    # max_resultsにハードリミットを設定（大量取得防止）
+    max_results = min(max_results, 10)
+
     items: list[IrasutoyaItem] = []
+
+    # セッション制限チェック
+    if limiter:
+        can, msg = limiter.can_search()
+        if not can:
+            print(f"  [制限] {msg}")
+            return items
+        limiter.wait_before_request(_SEARCH_DELAY)
 
     params = {"q": keyword, "max-results": str(max_results)}
     try:
         resp = requests.get(
-            IRASUTOYA_SEARCH, params=params, headers=_HEADERS, timeout=15
+            IRASUTOYA_SEARCH, params=params, headers=_HEADERS,
+            timeout=_REQUEST_TIMEOUT,
+            allow_redirects=False,  # リダイレクトを追跡しない
         )
         resp.raise_for_status()
+
+        if limiter:
+            limiter.record_search()
+
     except Exception as e:
         print(f"  検索失敗 ({keyword}): {e}")
+        if limiter:
+            limiter.record_search()  # 失敗もカウント（リトライ防止）
         return items
 
     soup = BeautifulSoup(resp.text, "html.parser")
@@ -201,6 +331,10 @@ def search_irasutoya(keyword: str, max_results: int = 10) -> list[IrasutoyaItem]
         if not image_url:
             continue
 
+        # URL安全性チェック
+        if not _validate_url(image_url):
+            continue
+
         # いらすとやの画像URLを正規化（高解像度版を取得）
         # Bloggerの画像URLは s72-c や s200 などのサイズ指定がある
         image_url = re.sub(r"/s\d+(-c)?/", "/s800/", image_url)
@@ -219,7 +353,16 @@ def search_irasutoya(keyword: str, max_results: int = 10) -> list[IrasutoyaItem]
 
 
 class IrasutoyaDownloader:
-    """いらすとや素材ダウンローダー（利用規約準拠）"""
+    """いらすとや素材ダウンローダー（利用規約準拠・サーバー保護付き）
+
+    安全策:
+    - 1セッションあたりの検索/DL/総リクエスト数に上限
+    - リクエスト間隔を十分に確保（検索3秒、DL5秒）
+    - ファイルサイズ上限（10MB）
+    - URLドメイン検証（いらすとや関連のみ）
+    - エラー時のリトライなし
+    - 20点のいらすとや利用規約カウント管理
+    """
 
     def __init__(
         self,
@@ -240,11 +383,20 @@ class IrasutoyaDownloader:
         )
         self.tracker = UsageTracker.load(self._tracker_path)
 
+        # セッションリミッター（インスタンスごとに1つ）
+        self._limiter = _SessionLimiter()
+
     def search(self, keyword: str, max_results: int = 5) -> list[IrasutoyaItem]:
-        """キーワードで素材を検索"""
+        """キーワードで素材を検索
+
+        Args:
+            keyword: 検索キーワード
+            max_results: 最大取得件数（ハードリミット: 10）
+        """
         print(f"  いらすとや検索: 「{keyword}」")
-        items = search_irasutoya(keyword, max_results=max_results)
-        print(f"  {len(items)}件見つかりました")
+        items = search_irasutoya(keyword, max_results=max_results,
+                                 limiter=self._limiter)
+        print(f"  {len(items)}件見つかりました [{self._limiter.stats()}]")
         return items
 
     def download(
@@ -252,7 +404,7 @@ class IrasutoyaDownloader:
         item: IrasutoyaItem,
         filename: str | None = None,
     ) -> IrasutoyaItem:
-        """素材をダウンロード
+        """素材をダウンロード（リトライなし・サイズ制限あり）
 
         Args:
             item: ダウンロード対象
@@ -261,6 +413,12 @@ class IrasutoyaDownloader:
         Returns:
             local_pathが設定されたIrasutoyaItem
         """
+        # セッション制限チェック
+        can_dl, dl_msg = self._limiter.can_download()
+        if not can_dl:
+            print(f"  [制限] {dl_msg}")
+            return item
+
         # 使用点数チェック
         can_use, msg = self.tracker.check_can_use()
         if not can_use:
@@ -272,13 +430,52 @@ class IrasutoyaDownloader:
             print(f"  画像URLなし: {item.title}")
             return item
 
+        # URL安全性チェック
+        if not _validate_url(item.image_url):
+            print(f"  [拒否] 許可されていないドメイン: {item.image_url}")
+            return item
+
+        # リクエスト間隔を確保
+        self._limiter.wait_before_request(_DOWNLOAD_DELAY)
+
         try:
+            # ストリーミングDL（サイズチェック付き）
             resp = requests.get(
-                item.image_url, headers=_HEADERS, timeout=30
+                item.image_url, headers=_HEADERS,
+                timeout=_REQUEST_TIMEOUT,
+                stream=True,
+                allow_redirects=False,
             )
             resp.raise_for_status()
-            data = resp.content
+
+            self._limiter.record_download()
+
+            # Content-Lengthチェック（ヘッダがある場合）
+            content_length = resp.headers.get("Content-Length")
+            if content_length and int(content_length) > _MAX_FILE_SIZE:
+                print(f"  [拒否] ファイルサイズ超過: "
+                      f"{int(content_length) / 1024 / 1024:.1f}MB "
+                      f"(上限 {_MAX_FILE_SIZE / 1024 / 1024:.0f}MB)")
+                resp.close()
+                return item
+
+            # チャンクごとに読み込み、サイズ上限を監視
+            chunks: list[bytes] = []
+            total_size = 0
+            for chunk in resp.iter_content(chunk_size=8192):
+                total_size += len(chunk)
+                if total_size > _MAX_FILE_SIZE:
+                    print(f"  [中断] DL中にファイルサイズ上限超過 "
+                          f"({total_size / 1024 / 1024:.1f}MB)")
+                    resp.close()
+                    return item
+                chunks.append(chunk)
+
+            data = b"".join(chunks)
+
         except Exception as e:
+            # リトライしない（失敗は即座に諦める）
+            self._limiter.record_download()  # 失敗もカウント
             print(f"  DL失敗 ({item.title}): {e}")
             return item
 
@@ -287,7 +484,6 @@ class IrasutoyaDownloader:
 
         # ファイル名決定
         if filename is None:
-            # キーワード + ハッシュで一意なファイル名
             safe_keyword = re.sub(r'[^\w]', '_', item.keyword or "irasutoya")
             filename = f"{safe_keyword}_{item.content_hash}.png"
 
@@ -296,7 +492,6 @@ class IrasutoyaDownloader:
         # 既にダウンロード済みか確認
         if dest.exists():
             item.local_path = str(dest)
-            # 重複でもトラッカーに登録（カウントは増えない）
             self.tracker.register_use(item, context="re-download")
             self._save_tracker()
             print(f"  既存: {dest.name}")
@@ -315,9 +510,9 @@ class IrasutoyaDownloader:
 
         status = "新規" if is_new else "重複（カウント増なし）"
         print(f"  保存: {dest.name} [{status}] "
-              f"({self.tracker.unique_count}/{MAX_FREE_ILLUSTRATIONS}点)")
+              f"({self.tracker.unique_count}/{MAX_FREE_ILLUSTRATIONS}点)"
+              f" [{self._limiter.stats()}]")
 
-        time.sleep(_REQUEST_DELAY)
         return item
 
     def search_and_download(
@@ -329,18 +524,27 @@ class IrasutoyaDownloader:
 
         Args:
             keyword: 検索キーワード
-            max_download: ダウンロードする最大数
+            max_download: ダウンロードする最大数（ハードリミット: 3）
 
         Returns:
             ダウンロード済みアイテムのリスト
         """
+        # DL数にハードリミット
+        max_download = min(max_download, 3)
+
         # 点数チェック
         can_use, msg = self.tracker.check_can_use()
         print(f"  使用状況: {msg}")
         if not can_use:
             return []
 
-        items = self.search(keyword, max_results=max_download + 5)
+        # セッション制限チェック
+        can_dl, dl_msg = self._limiter.can_download()
+        if not can_dl:
+            print(f"  [制限] {dl_msg}")
+            return []
+
+        items = self.search(keyword, max_results=max_download + 2)
         downloaded = []
 
         for item in items[:max_download]:
@@ -366,6 +570,7 @@ class IrasutoyaDownloader:
 
         print(f"\n=== いらすとや素材ダウンロード ===")
         print(f"  現在の使用点数: {self.tracker.unique_count}/{MAX_FREE_ILLUSTRATIONS}")
+        print(f"  セッション状況: {self._limiter.stats()}")
 
         for context, keyword in context_keywords.items():
             # ローカルに既にキーワードのファイルがあればスキップ
@@ -375,9 +580,16 @@ class IrasutoyaDownloader:
                 results[context] = []
                 continue
 
+            # 使用規約チェック
             can_use, msg = self.tracker.check_can_use()
             if not can_use:
                 print(f"  [中止] {msg}")
+                break
+
+            # セッション制限チェック
+            can_dl, dl_msg = self._limiter.can_download()
+            if not can_dl:
+                print(f"  [中止] {dl_msg}")
                 break
 
             print(f"  [{context}] 「{keyword}」を検索...")
@@ -385,6 +597,7 @@ class IrasutoyaDownloader:
             results[context] = downloaded
 
         print(f"\n  最終使用点数: {self.tracker.unique_count}/{MAX_FREE_ILLUSTRATIONS}")
+        print(f"  セッション最終: {self._limiter.stats()}")
         return results
 
     def get_usage_report(self) -> str:
@@ -393,6 +606,7 @@ class IrasutoyaDownloader:
             "=== いらすとや利用状況レポート ===",
             f"ユニーク素材数: {self.tracker.unique_count}/{MAX_FREE_ILLUSTRATIONS}点",
             f"残り無料枠: {self.tracker.remaining}点",
+            f"セッション: {self._limiter.stats()}",
         ]
         if self.tracker.is_over_limit:
             over = self.tracker.unique_count - MAX_FREE_ILLUSTRATIONS
