@@ -38,6 +38,7 @@ from .script_analyzer import (
     SceneLine,
     analyze_script,
     analyze_script_with_ai,
+    extract_topics_from_text,
     suggest_irasutoya_keyword,
 )
 
@@ -164,12 +165,20 @@ class OpenCrewPipeline:
             analysis = analyze_script(script)
 
         print(f"  タイトル: {analysis.title}")
-        print(f"  メインチャンピオン: {', '.join(analysis.main_champions)}")
-        print(f"  全登場チャンピオン: {', '.join(analysis.all_champions)}")
+        has_champions = bool(analysis.main_champions or analysis.all_champions)
+        if has_champions:
+            print(f"  メインチャンピオン: {', '.join(analysis.main_champions)}")
+            print(f"  全登場チャンピオン: {', '.join(analysis.all_champions)}")
+        else:
+            print("  メインチャンピオン: (LoLチャンピオン未検出)")
+            if analysis.main_topics:
+                print(f"  メイントピック: {', '.join(analysis.main_topics)}")
+            else:
+                print("  メイントピック: (未検出)")
         print(f"  セリフ数: {analysis.total_lines}")
 
-        # Step 2: Riot素材の自動ダウンロード
-        if self.auto_download_riot:
+        # Step 2: Riot素材の自動ダウンロード（チャンピオン検出時のみ）
+        if self.auto_download_riot and has_champions:
             print("\n=== OpenCrew: Riot素材自動ダウンロード ===")
             try:
                 self.riot_downloader.download_missing_only(
@@ -178,18 +187,24 @@ class OpenCrewPipeline:
             except Exception as e:
                 print(f"  [エラー] Riot素材ダウンロード失敗: {e}")
                 print("  ダウンロードをスキップして続行します")
+        elif self.auto_download_riot and not has_champions:
+            print("\n=== OpenCrew: Riot素材自動ダウンロード ===")
+            print("  チャンピオン未検出のためスキップ（トピックベースで素材選択）")
 
         # Step 3: 素材検索 & 不足チェック
         print("\n=== OpenCrew: 素材検索 ===")
         all_assets: dict[str, dict[str, list[AssetMatch]]] = {}
-        for champ in analysis.all_champions:
-            assets = self.finder.find_all_for_champion(champ)
-            all_assets[champ] = assets
-            splash_count = len(assets["splash"])
-            cine_count = len(assets["cinematic"])
-            icon_count = len(assets["icon"])
-            print(f"  {champ}: スプラッシュ={splash_count}, "
-                  f"シネマティック={cine_count}, アイコン={icon_count}")
+        if has_champions:
+            for champ in analysis.all_champions:
+                assets = self.finder.find_all_for_champion(champ)
+                all_assets[champ] = assets
+                splash_count = len(assets["splash"])
+                cine_count = len(assets["cinematic"])
+                icon_count = len(assets["icon"])
+                print(f"  {champ}: スプラッシュ={splash_count}, "
+                      f"シネマティック={cine_count}, アイコン={icon_count}")
+        else:
+            print("  チャンピオン未検出 → いらすとや素材・汎用素材で進行します")
 
         # シネマティック動画のクリッピング
         need_cinematic = any(
@@ -202,15 +217,22 @@ class OpenCrewPipeline:
                 self.clipper.process_all(cinematic_dir)
 
         # 不足素材チェック
-        missing = self.finder.check_missing(
-            analysis.all_champions, need_cinematic=need_cinematic
-        )
+        if has_champions:
+            missing = self.finder.check_missing(
+                analysis.all_champions, need_cinematic=need_cinematic
+            )
+        else:
+            missing = []
 
         # いらすとや素材の確認＆自動ダウンロード
-        irasutoya_lines = [
-            l for l in analysis.lines
-            if l.suggested_asset_type == "irasutoya_composite"
-        ]
+        # チャンピオン未検出時はすべてのセリフをいらすとや対象にする
+        if has_champions:
+            irasutoya_lines = [
+                l for l in analysis.lines
+                if l.suggested_asset_type == "irasutoya_composite"
+            ]
+        else:
+            irasutoya_lines = list(analysis.lines)
         if irasutoya_lines and self.auto_download_irasutoya:
             print("\n=== OpenCrew: いらすとや素材ダウンロード ===")
             # 場面ごとに必要なキーワードを集約
@@ -318,7 +340,18 @@ class OpenCrewPipeline:
                     if path:
                         splash_path = path
                         break
-            assignment.asset_path = splash_path or assignment.splash_bg_path
+            resolved = splash_path or assignment.splash_bg_path
+            if resolved:
+                assignment.asset_path = resolved
+            else:
+                # スプラッシュが無い場合（チャンピオン未検出時）→ いらすとやにフォールバック
+                keyword = line.suggested_irasutoya_keyword or suggest_irasutoya_keyword(
+                    line.scene_context, line.text
+                )
+                irasutoya_matches = self.finder.find_irasutoya(keyword)
+                if irasutoya_matches:
+                    assignment.asset_type = "irasutoya_composite"
+                    assignment.irasutoya_path = irasutoya_matches[0].path
 
         elif line.suggested_asset_type == "cinematic":
             cine_list = self.finder.find_cinematic()

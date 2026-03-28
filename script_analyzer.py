@@ -264,6 +264,7 @@ class ScriptAnalysis:
     subtitle: str = ""
     main_champions: list[str] = field(default_factory=list)  # メインチャンピオン
     all_champions: list[str] = field(default_factory=list)   # 全登場チャンピオン
+    main_topics: list[str] = field(default_factory=list)     # メイントピック（チャンピオン未検出時）
     lines: list[SceneLine] = field(default_factory=list)
     total_lines: int = 0
     scene_count: int = 0                     # シーン数
@@ -280,6 +281,67 @@ def _build_reverse_name_map() -> dict[str, str]:
 
 
 _REVERSE_NAME_MAP: dict[str, str] = _build_reverse_name_map()
+
+
+def extract_topics_from_text(
+    title: str,
+    topic: str = "",
+    description: str = "",
+    tags: list[str] | None = None,
+    lines_data: list[dict] | None = None,
+) -> list[str]:
+    """タイトル・トピック・タグ・台本テキストからメイントピックを抽出する
+
+    LoLチャンピオンが検出されなかった場合のフォールバックとして、
+    台本の主題をキーワードから推定する。
+    """
+    topics: list[str] = []
+    seen: set[str] = set()
+
+    def _add(t: str) -> None:
+        t = t.strip()
+        if t and t not in seen:
+            topics.append(t)
+            seen.add(t)
+
+    # tags から直接取得（最も信頼性が高い）
+    if tags:
+        for tag in tags:
+            _add(tag)
+
+    # topic フィールド
+    if topic:
+        _add(topic)
+
+    # タイトルからキーワード抽出（記号で分割）
+    if title:
+        # 「【】」「「」」「｜」「|」「/」「:」で区切られた部分を取得
+        parts = re.split(r'[【】「」｜|/:：\s]+', title)
+        for part in parts:
+            part = part.strip()
+            if len(part) >= 2:
+                _add(part)
+
+    # description の先頭部分
+    if description:
+        # 最初の句点・読点で区切り
+        first_sentence = re.split(r'[。！!、,]', description)[0].strip()
+        if len(first_sentence) >= 2:
+            _add(first_sentence)
+
+    # 行テキストからの頻出名詞的キーワード（簡易抽出）
+    if lines_data and not topics:
+        all_text = " ".join(line.get("text", "") for line in lines_data)
+        # カタカナ語（3文字以上）の頻度を集計
+        katakana_words = re.findall(r'[ァ-ヶー]{3,}', all_text)
+        freq: dict[str, int] = {}
+        for w in katakana_words:
+            freq[w] = freq.get(w, 0) + 1
+        # 頻出順にトピック追加（上位5件）
+        for word, _count in sorted(freq.items(), key=lambda x: -x[1])[:5]:
+            _add(word)
+
+    return topics
 
 
 def extract_champions_from_text(text: str) -> list[str]:
@@ -543,6 +605,18 @@ def analyze_script(script_data: dict) -> ScriptAnalysis:
         most_frequent = max(champion_frequency, key=champion_frequency.get)
         main_champions = [most_frequent]
 
+    # チャンピオンが1つも見つからなかった場合、トピック抽出でフォールバック
+    tags = sd.get("tags", [])
+    main_topics: list[str] = []
+    if not all_champions_set:
+        main_topics = extract_topics_from_text(
+            title=title,
+            topic=topic,
+            description=description,
+            tags=tags,
+            lines_data=lines_data,
+        )
+
     # シーン境界を検出して各行にマーキング
     scene_count = detect_scene_boundaries(scene_lines)
 
@@ -551,6 +625,7 @@ def analyze_script(script_data: dict) -> ScriptAnalysis:
         subtitle=subtitle,
         main_champions=main_champions,
         all_champions=sorted(all_champions_set),
+        main_topics=main_topics,
         lines=scene_lines,
         total_lines=total_lines,
         scene_count=scene_count,
@@ -584,8 +659,13 @@ def analyze_script_with_ai(
         for i, line in enumerate(lines_data)
     )
 
-    prompt = f"""以下はLoLチャンピオン紹介動画の台本です。各セリフの「場面の雰囲気」を判定してください。
+    title = sd.get("title", "")
+    has_champions = bool(analysis.main_champions or analysis.all_champions)
+    content_desc = "LoLチャンピオン紹介動画" if has_champions else "ゆっくり実況動画"
 
+    prompt = f"""以下は{content_desc}の台本です。各セリフの「場面の雰囲気」を判定してください。
+
+タイトル: {title}
 台本:
 {lines_text}
 
@@ -595,13 +675,13 @@ def analyze_script_with_ai(
   ...
 ]
 
-context の選択肢: introduction, battle, betrayal, sadness, friendship, training, resolution, call_to_action, general
+context の選択肢: introduction, battle, betrayal, sadness, friendship, training, resolution, call_to_action, surprise, excitement, question, explanation, new_content, thinking, anger, general
 asset_type の選択肢:
 - "splash" = スプラッシュアートのみ（導入、締め、厳かな場面）
 - "cinematic" = シネマティック動画（戦闘、ドラマチックな場面）
-- "irasutoya_composite" = いらすとや＋チャンピオンアイコン合成（感情表現、日常的な場面）
+- "irasutoya_composite" = いらすとや＋アイコン合成（感情表現、日常的な場面、解説シーン）
 
-irasutoya_keyword: irasutoya_compositeの場合のみ、適切ないらすとや素材の検索キーワード（日本語1-2語）"""
+irasutoya_keyword: irasutoya_compositeの場合、適切ないらすとや素材の検索キーワード（日本語1-2語）。splashやcinematicの場合は空文字。"""
 
     try:
         response = client.messages.create(
