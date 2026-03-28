@@ -278,107 +278,138 @@ class OpenCrewPipeline:
         match = self.finder.find_splash_default(champion_name)
         return match.path if match else ""
 
+    def _select_asset_for_line(
+        self,
+        line: SceneLine,
+        line_champs: list[str],
+        main_splash_path: str,
+        analysis: ScriptAnalysis,
+    ) -> LineAssetAssignment:
+        """1行分の素材を選択する（シーン切り替わり時に呼ばれる）"""
+        assignment = LineAssetAssignment(
+            line_index=line.index,
+            asset_type=line.suggested_asset_type,
+            champion_names=line_champs,
+        )
+
+        # 背景スプラッシュ: メインチャンピオン → 行チャンピオン → 全チャンピオンの順で探す
+        if main_splash_path:
+            assignment.splash_bg_path = main_splash_path
+        elif line_champs:
+            for champ in line_champs:
+                path = self._resolve_splash_for_champion(champ)
+                if path:
+                    assignment.splash_bg_path = path
+                    break
+        if not assignment.splash_bg_path and analysis.all_champions:
+            for champ in analysis.all_champions:
+                path = self._resolve_splash_for_champion(champ)
+                if path:
+                    assignment.splash_bg_path = path
+                    break
+
+        # アセットタイプに応じた素材選択
+        if line.suggested_asset_type == "splash":
+            splash_path = ""
+            if line.champions_mentioned:
+                for champ in line.champions_mentioned:
+                    path = self._resolve_splash_for_champion(champ)
+                    if path:
+                        splash_path = path
+                        break
+            assignment.asset_path = splash_path or assignment.splash_bg_path
+
+        elif line.suggested_asset_type == "cinematic":
+            cine_list = self.finder.find_cinematic()
+            if cine_list:
+                assignment.asset_path = cine_list[0].path
+            else:
+                assignment.asset_type = "splash"
+                assignment.asset_path = assignment.splash_bg_path
+
+        elif line.suggested_asset_type == "irasutoya_composite":
+            keyword = line.suggested_irasutoya_keyword
+            irasutoya_matches = self.finder.find_irasutoya(keyword)
+            if irasutoya_matches:
+                assignment.irasutoya_path = irasutoya_matches[0].path
+                for champ in line_champs:
+                    if not champ:
+                        continue
+                    icon = self.finder.find_icon_default(champ)
+                    if icon:
+                        assignment.icon_paths.append(icon.path)
+            else:
+                assignment.asset_type = "splash"
+                assignment.asset_path = assignment.splash_bg_path
+
+        return assignment
+
     def _assign_assets(
         self,
         analysis: ScriptAnalysis,
         all_assets: dict[str, dict[str, list[AssetMatch]]],
     ) -> list[LineAssetAssignment]:
-        """各セリフに素材を割り当て"""
+        """各セリフに素材を割り当て（シーン切り替わりポイントでのみ素材を決定）
+
+        シーン境界でのみ新しい素材を選択し、同一シーン内の行は
+        前のシーンの素材を引き継ぐ。generate_video.py側の current_asset
+        引き継ぎ機構と連携して、不要な素材切り替えを防ぐ。
+        """
         assignments: list[LineAssetAssignment] = []
         main_champ = analysis.main_champions[0] if analysis.main_champions else ""
-
-        # メインチャンピオンのデフォルトスプラッシュを事前解決
         main_splash_path = self._resolve_splash_for_champion(main_champ)
 
+        # 現在のシーンの素材（シーン内で引き継ぐ）
+        current_scene_assignment: LineAssetAssignment | None = None
+
+        print(f"  シーン数: {analysis.scene_count}")
+
         for line in analysis.lines:
-            # 行に登場するチャンピオン（なければメインチャンピオンをフォールバック）
             line_champs = line.champions_mentioned or ([main_champ] if main_champ else [])
 
-            assignment = LineAssetAssignment(
-                line_index=line.index,
-                asset_type=line.suggested_asset_type,
-                champion_names=line_champs,
-            )
+            if line.is_scene_change:
+                # シーン切り替わり → 新しい素材を選択
+                assignment = self._select_asset_for_line(
+                    line, line_champs, main_splash_path, analysis,
+                )
+                print(f"  シーン{line.scene_id}: セリフ{line.index + 1}～ "
+                      f"[{line.scene_context}] → {assignment.asset_type}")
 
-            # 背景スプラッシュ: メインチャンピオン → 行チャンピオン → 全チャンピオンの順で探す
-            if main_splash_path:
-                assignment.splash_bg_path = main_splash_path
-            elif line_champs:
-                for champ in line_champs:
-                    path = self._resolve_splash_for_champion(champ)
-                    if path:
-                        assignment.splash_bg_path = path
-                        break
-            if not assignment.splash_bg_path and analysis.all_champions:
-                for champ in analysis.all_champions:
-                    path = self._resolve_splash_for_champion(champ)
-                    if path:
-                        assignment.splash_bg_path = path
-                        break
+                # 確認モードでの判断
+                auto_decided = self._check_auto_decide(line, assignment)
+                assignment.auto_decided = auto_decided
 
-            # アセットタイプに応じた素材選択
-            if line.suggested_asset_type == "splash":
-                # 行のチャンピオンに対応するスプラッシュを優先使用
-                splash_path = ""
-                if line.champions_mentioned:
-                    for champ in line.champions_mentioned:
-                        path = self._resolve_splash_for_champion(champ)
-                        if path:
-                            splash_path = path
-                            break
-                assignment.asset_path = splash_path or assignment.splash_bg_path
-
-            elif line.suggested_asset_type == "cinematic":
-                # シネマティック動画はチャンピオン名で検索しない（手動配置）
-                # AIが動画内容から使える箇所を判断する
-                cine_list = self.finder.find_cinematic()
-                if cine_list:
-                    assignment.asset_path = cine_list[0].path
+                if not auto_decided and self.mode == "confirmation":
+                    assignment.confirmed = self._confirm_assignment(line, assignment)
                 else:
-                    # シネマティックがなければスプラッシュにフォールバック
-                    assignment.asset_type = "splash"
-                    assignment.asset_path = assignment.splash_bg_path
+                    assignment.confirmed = True
 
-            elif line.suggested_asset_type == "irasutoya_composite":
-                # いらすとや素材を検索
-                keyword = line.suggested_irasutoya_keyword
-                irasutoya_matches = self.finder.find_irasutoya(keyword)
-                if irasutoya_matches:
-                    assignment.irasutoya_path = irasutoya_matches[0].path
-                    # デフォルトアイコン（_0）を使用
-                    for champ in line_champs:
-                        if not champ:
-                            continue
-                        icon = self.finder.find_icon_default(champ)
-                        if icon:
-                            assignment.icon_paths.append(icon.path)
-                else:
-                    # いらすとやがなければスプラッシュにフォールバック
-                    assignment.asset_type = "splash"
-                    assignment.asset_path = assignment.splash_bg_path
+                # 判断を保存
+                if assignment.confirmed and assignment.asset_path:
+                    self.store.save_asset_decision(AssetDecision(
+                        scene_context=line.scene_context,
+                        champion_name=main_champ,
+                        asset_type=assignment.asset_type,
+                        asset_path=assignment.asset_path,
+                        irasutoya_path=assignment.irasutoya_path,
+                        confidence=1.0 if auto_decided else 0.8,
+                        confirmed=True,
+                    ))
 
-            # 確認モードでの判断
-            auto_decided = self._check_auto_decide(line, assignment)
-            assignment.auto_decided = auto_decided
-
-            if not auto_decided and self.mode == "confirmation":
-                assignment.confirmed = self._confirm_assignment(line, assignment)
+                current_scene_assignment = assignment
+                assignments.append(assignment)
             else:
-                assignment.confirmed = True
-
-            # 判断を保存
-            if assignment.confirmed and assignment.asset_path:
-                self.store.save_asset_decision(AssetDecision(
-                    scene_context=line.scene_context,
-                    champion_name=main_champ,
-                    asset_type=assignment.asset_type,
-                    asset_path=assignment.asset_path,
-                    irasutoya_path=assignment.irasutoya_path,
-                    confidence=1.0 if auto_decided else 0.8,
+                # シーン内 → 前シーンの素材を引き継ぎ（asset未設定にして継続）
+                assignment = LineAssetAssignment(
+                    line_index=line.index,
+                    asset_type="inherit",  # 引き継ぎマーカー
+                    champion_names=line_champs,
                     confirmed=True,
-                ))
-
-            assignments.append(assignment)
+                    auto_decided=True,
+                )
+                if current_scene_assignment:
+                    assignment.splash_bg_path = current_scene_assignment.splash_bg_path
+                assignments.append(assignment)
 
         return assignments
 
@@ -494,10 +525,12 @@ class OpenCrewPipeline:
         assignments: list[LineAssetAssignment],
         composite_images: dict[int, str],
     ) -> dict:
-        """台本JSONにassetフィールドを追加
+        """台本JSONにassetフィールドを追加（シーン切り替わり行のみ）
 
-        既存のprocess_script()がline.get("asset")で素材パスを読むので、
-        そのフォーマットに合わせて追加する。
+        既存のprocess_script()がline.get("asset")で素材パスを読み、
+        空でなければ current_asset を更新する仕組みに合わせて、
+        シーン切り替わり行でのみassetを設定する。
+        同一シーン内の行はassetフィールドなし → current_asset が引き継がれる。
         """
         enriched = copy.deepcopy(original_script)
         sd = enriched.get("scriptData", enriched)
@@ -506,6 +539,10 @@ class OpenCrewPipeline:
         for assignment in assignments:
             idx = assignment.line_index
             if idx < len(lines):
+                # "inherit"タイプ = シーン内引き継ぎ → assetフィールドを設定しない
+                if assignment.asset_type == "inherit":
+                    continue
+
                 asset_path = assignment.asset_path
                 if not asset_path and assignment.splash_bg_path:
                     asset_path = assignment.splash_bg_path

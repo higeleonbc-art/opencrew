@@ -253,6 +253,8 @@ class SceneLine:
     scene_context: str = "general"           # battle, betrayal, etc.
     suggested_asset_type: str = "splash"     # splash, cinematic, irasutoya_composite
     suggested_irasutoya_keyword: str = ""    # いらすとや素材の検索キーワード
+    is_scene_change: bool = False            # この行でシーンが切り替わるか
+    scene_id: int = 0                        # 所属するシーンの連番
 
 
 @dataclass
@@ -264,6 +266,7 @@ class ScriptAnalysis:
     all_champions: list[str] = field(default_factory=list)   # 全登場チャンピオン
     lines: list[SceneLine] = field(default_factory=list)
     total_lines: int = 0
+    scene_count: int = 0                     # シーン数
 
 
 def _build_reverse_name_map() -> dict[str, str]:
@@ -389,6 +392,89 @@ def suggest_irasutoya_keyword(scene_context: str, text: str) -> str:
     return ""
 
 
+# 似たコンテキストをグループ化（グループ内の変化はシーン切り替えにしない）
+_CONTEXT_GROUPS: dict[str, str] = {
+    # 導入・締め・一般
+    "introduction": "opening",
+    "call_to_action": "opening",
+    "general": "opening",
+    # 解説・説明系
+    "explanation": "info",
+    "thinking": "info",
+    "question": "info",
+    "new_content": "info",
+    "job_class": "info",
+    "dungeon": "info",
+    # アクション・ドラマ系
+    "battle": "action",
+    "betrayal": "action",
+    # 感情・リアクション系
+    "sadness": "emotion",
+    "surprise": "emotion",
+    "excitement": "emotion",
+    "anger": "emotion",
+    # 人間関係系
+    "friendship": "social",
+    "training": "social",
+    "resolution": "social",
+}
+
+
+def _get_context_group(context: str) -> str:
+    """コンテキストのグループを返す"""
+    return _CONTEXT_GROUPS.get(context, context)
+
+
+def detect_scene_boundaries(lines: list[SceneLine]) -> int:
+    """台本の行リストからシーン切り替わりポイントを検出する
+
+    以下の条件でシーン切り替わりを判定:
+    - コンテキストのグループが変化した（細かいコンテキスト変化は無視）
+    - 新しいチャンピオンが登場した（直近シーンにいなかったチャンピオンが出てきた）
+    - 冒頭は常にシーン開始
+
+    各行の is_scene_change と scene_id を更新して返す。
+    Returns: シーン数
+    """
+    if not lines:
+        return 0
+
+    scene_id = 0
+    # 現在のシーンで登場済みのチャンピオン
+    scene_champions: set[str] = set()
+
+    for i, line in enumerate(lines):
+        if i == 0:
+            line.is_scene_change = True
+            line.scene_id = scene_id
+            scene_champions = set(line.champions_mentioned)
+            continue
+
+        prev = lines[i - 1]
+        changed = False
+
+        # コンテキストグループの変化（同グループ内の変化は無視）
+        if _get_context_group(line.scene_context) != _get_context_group(prev.scene_context):
+            changed = True
+
+        # 新しいチャンピオンの登場（現シーン内でまだ出ていないチャンピオンが現れた）
+        if line.champions_mentioned:
+            new_champs = set(line.champions_mentioned) - scene_champions
+            if new_champs:
+                changed = True
+
+        if changed:
+            scene_id += 1
+            scene_champions = set(line.champions_mentioned)
+        else:
+            scene_champions.update(line.champions_mentioned)
+
+        line.is_scene_change = changed
+        line.scene_id = scene_id
+
+    return scene_id + 1
+
+
 def analyze_script(script_data: dict) -> ScriptAnalysis:
     """台本JSONを解析してチャンピオン名・場面コンテキストを抽出
 
@@ -457,6 +543,9 @@ def analyze_script(script_data: dict) -> ScriptAnalysis:
         most_frequent = max(champion_frequency, key=champion_frequency.get)
         main_champions = [most_frequent]
 
+    # シーン境界を検出して各行にマーキング
+    scene_count = detect_scene_boundaries(scene_lines)
+
     return ScriptAnalysis(
         title=title,
         subtitle=subtitle,
@@ -464,6 +553,7 @@ def analyze_script(script_data: dict) -> ScriptAnalysis:
         all_champions=sorted(all_champions_set),
         lines=scene_lines,
         total_lines=total_lines,
+        scene_count=scene_count,
     )
 
 
