@@ -266,12 +266,40 @@ class ScriptAnalysis:
     total_lines: int = 0
 
 
+def _build_reverse_name_map() -> dict[str, str]:
+    """英語名→日本語名の逆引きマップを構築"""
+    reverse = {}
+    for jp, en in CHAMPION_NAME_MAP.items():
+        reverse[en] = jp
+        # 大文字小文字の揺れに対応（Shen, shen, SHEN）
+        reverse[en.lower()] = jp
+    return reverse
+
+
+_REVERSE_NAME_MAP: dict[str, str] = _build_reverse_name_map()
+
+
 def extract_champions_from_text(text: str) -> list[str]:
-    """テキストからチャンピオン名を抽出"""
-    found = []
+    """テキストからチャンピオン名を抽出（日本語名＋英語名の両方対応）"""
+    found: list[str] = []
+    seen: set[str] = set()
+
+    # 日本語名で検索
     for jp_name in CHAMPION_NAME_MAP:
-        if jp_name in text:
+        if jp_name in text and jp_name not in seen:
             found.append(jp_name)
+            seen.add(jp_name)
+
+    # 英語名で検索（大文字小文字無視、単語境界を考慮）
+    for en_name, jp_name in _REVERSE_NAME_MAP.items():
+        if jp_name in seen:
+            continue
+        # 単語境界つきで検索（"Brand"が"Branding"にマッチしないように）
+        pattern = r'(?<![a-zA-Z])' + re.escape(en_name) + r'(?![a-zA-Z])'
+        if re.search(pattern, text, re.IGNORECASE):
+            found.append(jp_name)
+            seen.add(jp_name)
+
     return found
 
 
@@ -375,11 +403,22 @@ def analyze_script(script_data: dict) -> ScriptAnalysis:
     lines_data = sd.get("lines", [])
     total_lines = len(lines_data)
 
-    # タイトルからメインチャンピオンを抽出
+    # メインチャンピオンをタイトル・mainTweet・topic・descriptionから抽出
+    main_tweet = script_data.get("mainTweet", "")
+    topic = sd.get("topic", "")
+    description = sd.get("description", "")
+
+    # 優先度順にチェック: title → mainTweet → topic → description
     main_champions = extract_champions_from_text(title)
+    if not main_champions and main_tweet:
+        main_champions = extract_champions_from_text(main_tweet)
+    if not main_champions and topic:
+        main_champions = extract_champions_from_text(topic)
+    if not main_champions and description:
+        main_champions = extract_champions_from_text(description)
 
     # サブタイトル（" - "区切りの後半、または description の先頭）
-    subtitle = sd.get("description", "")
+    subtitle = description
     if " - " in title:
         parts = title.split(" - ", 1)
         title = parts[0]
@@ -388,6 +427,7 @@ def analyze_script(script_data: dict) -> ScriptAnalysis:
     # 全行を解析
     all_champions_set: set[str] = set(main_champions)
     scene_lines: list[SceneLine] = []
+    champion_frequency: dict[str, int] = {}  # 行テキストでの出現回数
 
     for i, line in enumerate(lines_data):
         text = line.get("text", "")
@@ -395,6 +435,8 @@ def analyze_script(script_data: dict) -> ScriptAnalysis:
 
         champions = extract_champions_from_text(text)
         all_champions_set.update(champions)
+        for c in champions:
+            champion_frequency[c] = champion_frequency.get(c, 0) + 1
 
         context = detect_scene_context(text)
         asset_type = suggest_asset_type(context, i, total_lines)
@@ -409,6 +451,11 @@ def analyze_script(script_data: dict) -> ScriptAnalysis:
             suggested_asset_type=asset_type,
             suggested_irasutoya_keyword=irasutoya_kw,
         ))
+
+    # メインチャンピオンが未検出なら、行テキスト中の最頻出チャンピオンをフォールバック
+    if not main_champions and champion_frequency:
+        most_frequent = max(champion_frequency, key=champion_frequency.get)
+        main_champions = [most_frequent]
 
     return ScriptAnalysis(
         title=title,

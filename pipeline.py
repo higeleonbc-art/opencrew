@@ -271,6 +271,13 @@ class OpenCrewPipeline:
 
         return result
 
+    def _resolve_splash_for_champion(self, champion_name: str) -> str:
+        """チャンピオン名からデフォルトスプラッシュアートのパスを返す"""
+        if not champion_name:
+            return ""
+        match = self.finder.find_splash_default(champion_name)
+        return match.path if match else ""
+
     def _assign_assets(
         self,
         analysis: ScriptAnalysis,
@@ -280,22 +287,46 @@ class OpenCrewPipeline:
         assignments: list[LineAssetAssignment] = []
         main_champ = analysis.main_champions[0] if analysis.main_champions else ""
 
+        # メインチャンピオンのデフォルトスプラッシュを事前解決
+        main_splash_path = self._resolve_splash_for_champion(main_champ)
+
         for line in analysis.lines:
+            # 行に登場するチャンピオン（なければメインチャンピオンをフォールバック）
+            line_champs = line.champions_mentioned or ([main_champ] if main_champ else [])
+
             assignment = LineAssetAssignment(
                 line_index=line.index,
                 asset_type=line.suggested_asset_type,
-                champion_names=line.champions_mentioned or [main_champ],
+                champion_names=line_champs,
             )
 
-            # メインチャンピオンの _0 スプラッシュを背景として常に設定
-            if main_champ:
-                default_splash = self.finder.find_splash_default(main_champ)
-                if default_splash:
-                    assignment.splash_bg_path = default_splash.path
+            # 背景スプラッシュ: メインチャンピオン → 行チャンピオン → 全チャンピオンの順で探す
+            if main_splash_path:
+                assignment.splash_bg_path = main_splash_path
+            elif line_champs:
+                for champ in line_champs:
+                    path = self._resolve_splash_for_champion(champ)
+                    if path:
+                        assignment.splash_bg_path = path
+                        break
+            if not assignment.splash_bg_path and analysis.all_champions:
+                for champ in analysis.all_champions:
+                    path = self._resolve_splash_for_champion(champ)
+                    if path:
+                        assignment.splash_bg_path = path
+                        break
 
             # アセットタイプに応じた素材選択
             if line.suggested_asset_type == "splash":
-                assignment.asset_path = assignment.splash_bg_path
+                # 行のチャンピオンに対応するスプラッシュを優先使用
+                splash_path = ""
+                if line.champions_mentioned:
+                    for champ in line.champions_mentioned:
+                        path = self._resolve_splash_for_champion(champ)
+                        if path:
+                            splash_path = path
+                            break
+                assignment.asset_path = splash_path or assignment.splash_bg_path
 
             elif line.suggested_asset_type == "cinematic":
                 # シネマティック動画はチャンピオン名で検索しない（手動配置）
@@ -315,7 +346,9 @@ class OpenCrewPipeline:
                 if irasutoya_matches:
                     assignment.irasutoya_path = irasutoya_matches[0].path
                     # デフォルトアイコン（_0）を使用
-                    for champ in (line.champions_mentioned or [main_champ]):
+                    for champ in line_champs:
+                        if not champ:
+                            continue
                         icon = self.finder.find_icon_default(champ)
                         if icon:
                             assignment.icon_paths.append(icon.path)
