@@ -51,9 +51,10 @@ _SEARCH_DELAY = 3.0        # 検索リクエスト後の待機時間
 _DOWNLOAD_DELAY = 5.0      # DLリクエスト後の待機時間
 
 # 1セッション（1インスタンスのライフタイム）あたりの上限
-_MAX_REQUESTS_PER_SESSION = 30     # 全リクエスト（検索+DL）の上限
-_MAX_DOWNLOADS_PER_SESSION = 10    # DLの上限
-_MAX_SEARCHES_PER_SESSION = 10     # 検索の上限
+# 2段階方式（検索ページ + 個別ページ）のため検索上限を広めに確保
+_MAX_REQUESTS_PER_SESSION = 60     # 全リクエスト（検索+DL）の上限
+_MAX_DOWNLOADS_PER_SESSION = 20    # DLの上限
+_MAX_SEARCHES_PER_SESSION = 40     # 検索の上限（検索ページ + 個別ページ）
 
 # ファイルサイズ上限（バイト）: 想定外の巨大ファイルを防止
 _MAX_FILE_SIZE = 10 * 1024 * 1024  # 10MB
@@ -263,6 +264,74 @@ class _SessionLimiter:
         )
 
 
+def _extract_image_from_page(
+    page_url: str,
+    limiter: _SessionLimiter | None = None,
+) -> str:
+    """個別のいらすとやブログ記事ページから画像直リンクを取得
+
+    参考: https://hashikake.com/scraping_img
+    .separator > a のhref属性から元画像URLを取得する方式。
+
+    Args:
+        page_url: いらすとやの個別記事URL
+        limiter: セッションリミッター
+
+    Returns:
+        画像URL（取得できない場合は空文字列）
+    """
+    if limiter:
+        can, msg = limiter.can_search()
+        if not can:
+            return ""
+        limiter.wait_before_request(_SEARCH_DELAY)
+
+    try:
+        resp = requests.get(
+            page_url, headers=_HEADERS, timeout=_REQUEST_TIMEOUT,
+        )
+        resp.raise_for_status()
+        if limiter:
+            limiter.record_search()
+    except Exception as e:
+        print(f"    ページ取得失敗 ({page_url}): {e}")
+        if limiter:
+            limiter.record_search()
+        return ""
+
+    soup = BeautifulSoup(resp.text, "html.parser")
+
+    # 方法1: .separator > a のhref（参考コードの方式 — 元画像の直リンク）
+    for a_tag in soup.select(".separator > a"):
+        href = a_tag.get("href", "")
+        if not href:
+            continue
+        if _validate_url(href):
+            # png/jpgの直リンクまたはblogger.googleusercontent.com
+            if re.search(r"\.(png|jpg|jpeg)$", href, re.IGNORECASE):
+                return href
+            if "blogger.googleusercontent.com" in href:
+                return href
+
+    # 方法2: .separator内のimg src（フォールバック）
+    for img in soup.select(".separator img"):
+        src = img.get("src", "")
+        if src and _validate_url(src):
+            src = re.sub(r"/s\d+(-c)?/", "/s800/", src)
+            src = re.sub(r"=s\d+(-c)?$", "=s800", src)
+            return src
+
+    # 方法3: .post-body内のimg（最終フォールバック）
+    for img in soup.select(".post-body img"):
+        src = img.get("src", "")
+        if src and _validate_url(src):
+            src = re.sub(r"/s\d+(-c)?/", "/s800/", src)
+            src = re.sub(r"=s\d+(-c)?$", "=s800", src)
+            return src
+
+    return ""
+
+
 def search_irasutoya(
     keyword: str,
     max_results: int = 5,
@@ -270,7 +339,11 @@ def search_irasutoya(
 ) -> list[IrasutoyaItem]:
     """いらすとやサイトをキーワード検索
 
-    Google Bloggerベースの検索機能を利用。
+    参考: https://qiita.com/japanesebonobo/items/eb374a94ed0456c88ed7
+
+    2段階方式:
+    1. 検索結果ページから個別記事のURLを収集
+    2. 各記事ページにアクセスし .separator > a から画像URLを取得
 
     Args:
         keyword: 検索キーワード（日本語）
@@ -312,31 +385,51 @@ def search_irasutoya(
 
     soup = BeautifulSoup(resp.text, "html.parser")
 
-    # いらすとやはBlogger形式。記事一覧から画像URLを抽出
-    for post in soup.select(".post"):
-        title_elem = post.select_one(".post-title a, h2 a, h3 a")
-        if not title_elem:
-            continue
+    # Step 1: 検索結果から個別記事URLを収集（参考コードの方式）
+    page_links: list[tuple[str, str]] = []  # (title, url)
+    for a_tag in soup.select("a[href]"):
+        href = a_tag.get("href", "")
+        # いらすとやの個別記事URL: irasutoya.com/*blog-post*.html
+        if re.search(r'irasutoya.*blog-post.*html$', href):
+            title = a_tag.get_text(strip=True) or ""
+            if href not in [u for _, u in page_links]:
+                page_links.append((title, href))
+                if len(page_links) >= max_results:
+                    break
 
-        title = title_elem.get_text(strip=True)
-        page_url = title_elem.get("href", "")
+    # .post セレクタからも取得（フォールバック）
+    if not page_links:
+        for post in soup.select(".post"):
+            title_elem = post.select_one(".post-title a, h2 a, h3 a")
+            if not title_elem:
+                continue
+            title = title_elem.get_text(strip=True)
+            page_url = title_elem.get("href", "")
+            if page_url and page_url not in [u for _, u in page_links]:
+                page_links.append((title, page_url))
+                if len(page_links) >= max_results:
+                    break
 
-        # 記事内の画像を取得
-        img_elem = post.select_one(".post-body img, .separator img, .entry img")
-        if not img_elem:
-            continue
-
-        image_url = img_elem.get("src", "")
+    # Step 2: 各記事ページから画像URLを取得
+    for title, page_url in page_links:
+        image_url = _extract_image_from_page(page_url, limiter=limiter)
         if not image_url:
-            continue
-
-        # URL安全性チェック
-        if not _validate_url(image_url):
-            continue
-
-        # いらすとやの画像URLを正規化（高解像度版を取得）
-        # Bloggerの画像URLは s72-c や s200 などのサイズ指定がある
-        image_url = re.sub(r"/s\d+(-c)?/", "/s800/", image_url)
+            # フォールバック: 検索結果ページ内のサムネイルから取得
+            for post in soup.select(".post"):
+                link = post.select_one("a[href]")
+                if link and link.get("href") == page_url:
+                    img = post.select_one(
+                        ".post-body img, .separator img, .entry img"
+                    )
+                    if img:
+                        src = img.get("src", "")
+                        if src and _validate_url(src):
+                            image_url = re.sub(r"/s\d+(-c)?/", "/s800/", src)
+                            image_url = re.sub(r"=s\d+(-c)?$", "=s800",
+                                               image_url)
+                    break
+            if not image_url:
+                continue
 
         items.append(IrasutoyaItem(
             title=title,

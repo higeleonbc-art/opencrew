@@ -214,13 +214,31 @@ CHAMPION_NAME_MAP: dict[str, str] = {
 
 # 場面コンテキストのキーワードマッピング
 SCENE_KEYWORDS: dict[str, list[str]] = {
-    "battle": ["戦", "襲撃", "攻撃", "倒", "殺", "激突", "対決", "斬", "戦闘"],
+    "battle": ["戦", "襲撃", "攻撃", "倒", "殺", "激突", "対決", "斬", "戦闘",
+               "バトル", "レイド", "討伐", "ボス", "零式", "絶"],
     "betrayal": ["裏切", "離れ", "失望", "敵", "去っ", "反逆"],
-    "sadness": ["悲し", "涙", "失", "死", "亡", "別れ", "重い"],
-    "introduction": ["紹介", "今回は", "1分紹介", "1分解説"],
-    "friendship": ["友", "仲", "兄弟", "共に", "一緒", "絆"],
-    "training": ["修行", "鍛", "育", "修練"],
+    "sadness": ["悲し", "涙", "失", "死", "亡", "別れ", "重い", "残念", "辛い"],
+    "introduction": ["紹介", "今回は", "1分紹介", "1分解説", "まとめ", "解説",
+                     "についてだぜ", "について"],
+    "surprise": ["驚", "すごい", "やばい", "ヤバい", "まじ", "マジ", "えっ",
+                 "うそ", "ウソ", "びっくり", "衝撃"],
+    "excitement": ["楽しみ", "わくわく", "ワクワク", "嬉し", "最高", "神",
+                   "熱い", "アツい", "きた", "キタ", "待ってた"],
+    "question": ["なに", "何", "どう", "なんで", "教えて", "知ってる",
+                 "？", "分から", "わから"],
+    "explanation": ["つまり", "要するに", "ポイント", "具体的", "例えば",
+                    "簡単に", "説明", "仕組み", "システム", "コンテンツ"],
+    "new_content": ["新しい", "追加", "実装", "アップデート", "パッチ", "新コンテンツ",
+                    "新ジョブ", "新ダンジョン", "新レイド", "変更", "調整"],
+    "job_class": ["ジョブ", "クラス", "タンク", "ヒーラー", "DPS", "アタッカー",
+                  "スキル", "アビリティ", "特性", "ロール"],
+    "dungeon": ["ダンジョン", "ID", "インスタンス", "迷宮", "洞窟"],
+    "friendship": ["友", "仲", "兄弟", "共に", "一緒", "絆", "パーティ", "PT",
+                   "固定", "メンバー"],
+    "training": ["修行", "鍛", "育", "修練", "練習", "予習"],
     "resolution": ["決意", "継ぎ", "守り", "選び", "背負", "再建", "使命"],
+    "thinking": ["考え", "悩", "迷", "うーん", "むずかし", "難し", "微妙"],
+    "anger": ["怒", "ふざけ", "ひどい", "許せ", "イライラ", "ムカ"],
     "call_to_action": ["チャンネル登録", "よろしく", "コメント", "いいね"],
 }
 
@@ -275,7 +293,7 @@ def suggest_asset_type(scene_context: str, line_index: int, total_lines: int) ->
     ルール:
     - introduction / call_to_action → splash（シンプルに）
     - battle / betrayal → cinematic（動きのあるシーン）
-    - friendship / training / sadness → irasutoya_composite（感情表現）
+    - 感情・リアクション・解説系 → irasutoya_composite（感情表現）
     - resolution → splash（厳かに）
     - 冒頭と末尾 → splash（安定感）
     """
@@ -283,7 +301,11 @@ def suggest_asset_type(scene_context: str, line_index: int, total_lines: int) ->
         return "splash"
 
     cinematic_contexts = {"battle", "betrayal"}
-    composite_contexts = {"friendship", "training", "sadness"}
+    composite_contexts = {
+        "friendship", "training", "sadness",
+        "surprise", "excitement", "question", "explanation",
+        "new_content", "job_class", "dungeon", "thinking", "anger",
+    }
 
     if scene_context in cinematic_contexts:
         return "cinematic"
@@ -293,7 +315,11 @@ def suggest_asset_type(scene_context: str, line_index: int, total_lines: int) ->
 
 
 def suggest_irasutoya_keyword(scene_context: str, text: str) -> str:
-    """場面に適したいらすとや検索キーワードを提案"""
+    """場面に適したいらすとや検索キーワードを提案
+
+    テキスト内のキーワードも考慮して、いらすとやで検索しやすい
+    日本語キーワードを返す。
+    """
     keyword_map = {
         "battle": "戦い",
         "betrayal": "裏切り",
@@ -301,8 +327,38 @@ def suggest_irasutoya_keyword(scene_context: str, text: str) -> str:
         "friendship": "友達",
         "training": "修行",
         "resolution": "決意",
+        "surprise": "驚く",
+        "excitement": "喜ぶ",
+        "question": "疑問 はてな",
+        "explanation": "説明",
+        "new_content": "アップデート",
+        "job_class": "勇者",
+        "dungeon": "ダンジョン 洞窟",
+        "thinking": "考える",
+        "anger": "怒る",
     }
-    return keyword_map.get(scene_context, "")
+
+    # コンテキストからのキーワード
+    kw = keyword_map.get(scene_context, "")
+    if kw:
+        return kw
+
+    # テキスト内の具体的なキーワードからフォールバック推定
+    text_keyword_map = [
+        (["ゲーム", "プレイ"], "ゲーム"),
+        (["パソコン", "PC"], "パソコン"),
+        (["剣", "武器"], "剣"),
+        (["魔法", "魔"], "魔法使い"),
+        (["ニュース", "速報", "情報"], "ニュース"),
+        (["チーム", "パーティ", "仲間"], "パーティ 仲間"),
+        (["強い", "最強", "OP"], "強い 筋肉"),
+        (["弱い", "ナーフ", "下方"], "弱い 落ち込む"),
+    ]
+    for triggers, keyword in text_keyword_map:
+        if any(t in text for t in triggers):
+            return keyword
+
+    return ""
 
 
 def analyze_script(script_data: dict) -> ScriptAnalysis:
