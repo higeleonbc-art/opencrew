@@ -46,7 +46,7 @@ from .script_analyzer import (
 class LineAssetAssignment:
     """各セリフへの素材割り当て"""
     line_index: int
-    asset_type: str              # "splash", "cinematic", "irasutoya_composite"
+    asset_type: str              # "splash", "cinematic", "irasutoya_composite", "inherit"
     asset_path: str = ""         # 最終的な素材パス
     splash_bg_path: str = ""     # 背景スプラッシュアート
     irasutoya_path: str = ""     # いらすとや元画像（合成時）
@@ -54,6 +54,7 @@ class LineAssetAssignment:
     champion_names: list[str] = field(default_factory=list)
     confirmed: bool = False
     auto_decided: bool = False
+    is_insertion: bool = False   # True = 一時挿入素材（シネマティック/いらすとや合成）
 
 
 @dataclass
@@ -349,18 +350,31 @@ class OpenCrewPipeline:
         analysis: ScriptAnalysis,
         all_assets: dict[str, dict[str, list[AssetMatch]]],
     ) -> list[LineAssetAssignment]:
-        """各セリフに素材を割り当て（シーン切り替わりポイントでのみ素材を決定）
+        """各セリフに素材を割り当て（挿入・復帰モデル）
 
-        シーン境界でのみ新しい素材を選択し、同一シーン内の行は
-        前のシーンの素材を引き継ぐ。generate_video.py側の current_asset
-        引き継ぎ機構と連携して、不要な素材切り替えを防ぐ。
+        素材階層:
+        - ベース: スプラッシュアート(A) = 常に復帰先として保持
+        - 挿入:   シネマティック(B) / いらすとや合成(C) = 一時的に表示
+
+        遷移ルール:
+        - A→B, A→C: 場面内容に応じて挿入
+        - B終了→A: 必ずベーススプラッシュに復帰
+        - C終了→A: 必ずベーススプラッシュに復帰
+        - C→B: 許可（ただしB終了後はAに復帰、Cには戻らない）
+        - B→C: 禁止（Aを挟む必要あり）
         """
         assignments: list[LineAssetAssignment] = []
         main_champ = analysis.main_champions[0] if analysis.main_champions else ""
         main_splash_path = self._resolve_splash_for_champion(main_champ)
 
-        # 現在のシーンの素材（シーン内で引き継ぐ）
+        # ベーススプラッシュ = 復帰先（splash型シーンで更新される）
+        base_splash_path = main_splash_path
+        # 前シーンのアセットタイプ（遷移ルール判定用）
+        prev_scene_type: str = ""
+        # 現在のシーンの素材
         current_scene_assignment: LineAssetAssignment | None = None
+
+        _INSERTION_TYPES = {"cinematic", "irasutoya_composite"}
 
         print(f"  シーン数: {analysis.scene_count}")
 
@@ -368,14 +382,50 @@ class OpenCrewPipeline:
             line_champs = line.champions_mentioned or ([main_champ] if main_champ else [])
 
             if line.is_scene_change:
-                # シーン切り替わり → 新しい素材を選択
+                target_type = line.suggested_asset_type
+
+                # --- 遷移ルール適用 ---
+                # ルール1: B→C 禁止（スプラッシュに強制復帰）
+                if (prev_scene_type == "cinematic"
+                        and target_type == "irasutoya_composite"):
+                    target_type = "splash"
+                    print(f"  [ルール] B→C禁止: シネマティック後のいらすとや合成を"
+                          f"スプラッシュ復帰に変更")
+
+                # ルール2: 挿入→挿入（同種除く、C→B除く）は間にスプラッシュ復帰
+                if (prev_scene_type in _INSERTION_TYPES
+                        and target_type in _INSERTION_TYPES
+                        and target_type == prev_scene_type):
+                    # 同種挿入の連続: 異なる素材なので素材切替として許可
+                    pass
+                # C→B は許可（ルール1でB→Cは既にブロック済み）
+
+                # ルール3: 挿入終了 → ベーススプラッシュに復帰
+                # （次のシーンがsplash型なら自然復帰。挿入型なら上のルールで制御済み）
+
+                # 素材選択（target_typeが変更されている可能性あり）
+                # target_typeでline.suggested_asset_typeを一時的に上書き
+                original_type = line.suggested_asset_type
+                line.suggested_asset_type = target_type
+
                 assignment = self._select_asset_for_line(
                     line, line_champs, main_splash_path, analysis,
                 )
-                print(f"  シーン{line.scene_id}: セリフ{line.index + 1}～ "
-                      f"[{line.scene_context}] → {assignment.asset_type}")
 
-                # 確認モードでの判断
+                line.suggested_asset_type = original_type  # 復元
+
+                # 挿入フラグ設定
+                assignment.is_insertion = assignment.asset_type in _INSERTION_TYPES
+
+                # ベーススプラッシュの追跡
+                if assignment.asset_type == "splash" and assignment.asset_path:
+                    base_splash_path = assignment.asset_path
+
+                label = "挿入" if assignment.is_insertion else "ベース"
+                print(f"  シーン{line.scene_id}: セリフ{line.index + 1}～ "
+                      f"[{line.scene_context}] → {assignment.asset_type} ({label})")
+
+                # 確認モードでの判断（挿入時のみ確認）
                 auto_decided = self._check_auto_decide(line, assignment)
                 assignment.auto_decided = auto_decided
 
@@ -396,19 +446,21 @@ class OpenCrewPipeline:
                         confirmed=True,
                     ))
 
+                prev_scene_type = assignment.asset_type
                 current_scene_assignment = assignment
                 assignments.append(assignment)
             else:
-                # シーン内 → 前シーンの素材を引き継ぎ（asset未設定にして継続）
+                # シーン内 → 前シーンの素材を引き継ぎ
                 assignment = LineAssetAssignment(
                     line_index=line.index,
-                    asset_type="inherit",  # 引き継ぎマーカー
+                    asset_type="inherit",
                     champion_names=line_champs,
+                    splash_bg_path=base_splash_path,
                     confirmed=True,
                     auto_decided=True,
                 )
                 if current_scene_assignment:
-                    assignment.splash_bg_path = current_scene_assignment.splash_bg_path
+                    assignment.is_insertion = current_scene_assignment.is_insertion
                 assignments.append(assignment)
 
         return assignments
@@ -525,30 +577,50 @@ class OpenCrewPipeline:
         assignments: list[LineAssetAssignment],
         composite_images: dict[int, str],
     ) -> dict:
-        """台本JSONにassetフィールドを追加（シーン切り替わり行のみ）
+        """台本JSONにassetフィールドを追加（挿入・復帰モデル対応）
 
-        既存のprocess_script()がline.get("asset")で素材パスを読み、
-        空でなければ current_asset を更新する仕組みに合わせて、
-        シーン切り替わり行でのみassetを設定する。
-        同一シーン内の行はassetフィールドなし → current_asset が引き継がれる。
+        素材の設定ルール:
+        - シーン切り替わり行: asset を設定（新しい素材を表示）
+        - シーン内引き継ぎ行: asset を設定しない（current_asset が継続）
+        - 挿入→非挿入の遷移: 挿入終了後のベーススプラッシュ復帰を保証
+
+        generate_video.py の current_asset 引き継ぎ機構と連携し、
+        挿入素材（B/C）は一時的に表示され、終了後は自動的にスプラッシュ（A）に戻る。
         """
         enriched = copy.deepcopy(original_script)
         sd = enriched.get("scriptData", enriched)
         lines = sd.get("lines", [])
 
+        # 前のシーン切替が挿入だったかを追跡
+        prev_was_insertion = False
+
         for assignment in assignments:
             idx = assignment.line_index
-            if idx < len(lines):
-                # "inherit"タイプ = シーン内引き継ぎ → assetフィールドを設定しない
-                if assignment.asset_type == "inherit":
-                    continue
+            if idx >= len(lines):
+                continue
 
-                asset_path = assignment.asset_path
-                if not asset_path and assignment.splash_bg_path:
-                    asset_path = assignment.splash_bg_path
+            if assignment.asset_type == "inherit":
+                # シーン内引き継ぎ → asset を設定しない
+                continue
 
+            # シーン切り替わり行
+            asset_path = assignment.asset_path
+            if not asset_path and assignment.splash_bg_path:
+                asset_path = assignment.splash_bg_path
+
+            if assignment.is_insertion:
+                # 挿入素材（B/C）→ 一時的にこの素材を表示
                 if asset_path:
                     lines[idx]["asset"] = asset_path
+                prev_was_insertion = True
+            else:
+                # ベース素材（A）
+                if asset_path:
+                    lines[idx]["asset"] = asset_path
+                elif prev_was_insertion and assignment.splash_bg_path:
+                    # 挿入終了後 → ベーススプラッシュに強制復帰
+                    lines[idx]["asset"] = assignment.splash_bg_path
+                prev_was_insertion = False
 
         return enriched
 
