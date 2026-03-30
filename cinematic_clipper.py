@@ -84,10 +84,11 @@ def get_video_info(video_path: str) -> VideoInfo:
     ]
     try:
         result = subprocess.run(
-            cmd, capture_output=True, text=True, timeout=30
+            cmd, capture_output=True, text=True, timeout=30,
+            encoding="utf-8", errors="replace",
         )
         data = json.loads(result.stdout)
-    except (subprocess.TimeoutExpired, json.JSONDecodeError, FileNotFoundError) as e:
+    except (subprocess.TimeoutExpired, json.JSONDecodeError, TypeError, FileNotFoundError) as e:
         return VideoInfo(path=video_path)
 
     fmt = data.get("format", {})
