@@ -294,10 +294,30 @@ class OpenCrewPipeline:
 
         return result
 
-    def _resolve_splash_for_champion(self, champion_name: str) -> str:
-        """チャンピオン名からデフォルトスプラッシュアートのパスを返す"""
+    def _resolve_splash_for_champion(
+        self, champion_name: str, exclude_path: str = ""
+    ) -> str:
+        """チャンピオン名からスプラッシュアートのパスを返す
+
+        Args:
+            champion_name: チャンピオン名
+            exclude_path: 除外するパス（背景と異なるスキンを選びたい場合）
+        """
         if not champion_name:
             return ""
+        if exclude_path:
+            # 別スキン（_1以上）を優先
+            skins = self.finder.find_splash_skins(champion_name)
+            for skin in skins:
+                if skin.path != exclude_path:
+                    return skin.path
+            # 別スキンがなければ全スプラッシュからexclude以外を探す
+            all_splash = self.finder.find_splash(champion_name)
+            for m in all_splash:
+                if m.path != exclude_path:
+                    return m.path
+            # すべて同一パスならフォールバック
+            return all_splash[0].path if all_splash else ""
         match = self.finder.find_splash_default(champion_name)
         return match.path if match else ""
 
@@ -336,7 +356,10 @@ class OpenCrewPipeline:
             splash_path = ""
             if line.champions_mentioned:
                 for champ in line.champions_mentioned:
-                    path = self._resolve_splash_for_champion(champ)
+                    # コンテンツエリアには背景と異なるスキンを優先選択
+                    path = self._resolve_splash_for_champion(
+                        champ, exclude_path=assignment.splash_bg_path
+                    )
                     if path:
                         splash_path = path
                         break
